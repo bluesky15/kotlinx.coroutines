@@ -68,6 +68,15 @@ import kotlin.native.concurrent.*
  * the `onBufferOverflow` parameter, which is equal to one of the entries of the [BufferOverflow] enum. When a strategy other
  * than [SUSPENDED][BufferOverflow.SUSPEND] is configured, emissions to the shared flow never suspend.
  *
+ * ### Unbuffered shared flow
+ *
+ * A default implementation of a shared flow that is created with `MutableSharedFlow()` constructor function
+ * without parameters has no replay cache nor additional buffer.
+ * [emit][MutableSharedFlow.emit] call to such a shared flow suspends until all subscribers receive the emitted value
+ * and returns immediately if there are no subscribers.
+ * Thus, [tryEmit][MutableSharedFlow.tryEmit] call succeeds and returns `true` only if
+ * there are no subscribers (in which case the emitted value is immediately lost).
+ *
  * ### SharedFlow vs BroadcastChannel
  *
  * Conceptually shared flow is similar to [BroadcastChannel][BroadcastChannel]
@@ -108,7 +117,6 @@ import kotlin.native.concurrent.*
  * might be added to this interface in the future, but is stable for use.
  * Use the `MutableSharedFlow(replay, ...)` constructor function to create an implementation.
  */
-@ExperimentalCoroutinesApi
 public interface SharedFlow<out T> : Flow<T> {
     /**
      * A snapshot of the replay cache.
@@ -138,8 +146,18 @@ public interface SharedFlow<out T> : Flow<T> {
  * might be added to this interface in the future, but is stable for use.
  * Use the `MutableSharedFlow(...)` constructor function to create an implementation.
  */
-@ExperimentalCoroutinesApi
 public interface MutableSharedFlow<T> : SharedFlow<T>, FlowCollector<T> {
+    /**
+     * Emits a [value] to this shared flow, suspending on buffer overflow if the shared flow was created
+     * with the default [BufferOverflow.SUSPEND] strategy.
+     *
+     * See [tryEmit] for a non-suspending variant of this function.
+     *
+     * This method is **thread-safe** and can be safely invoked from concurrent coroutines without
+     * external synchronization.
+     */
+    override suspend fun emit(value: T)
+
     /**
      * Tries to emit a [value] to this shared flow without suspending. It returns `true` if the value was
      * emitted successfully. When this function returns `false`, it means that the call to a plain [emit]
@@ -148,6 +166,9 @@ public interface MutableSharedFlow<T> : SharedFlow<T>, FlowCollector<T> {
      * A shared flow configured with a [BufferOverflow] strategy other than [SUSPEND][BufferOverflow.SUSPEND]
      * (either [DROP_OLDEST][BufferOverflow.DROP_OLDEST] or [DROP_LATEST][BufferOverflow.DROP_LATEST]) never
      * suspends on [emit], and thus `tryEmit` to such a shared flow always returns `true`.
+     *
+     * This method is **thread-safe** and can be safely invoked from concurrent coroutines without
+     * external synchronization.
      */
     public fun tryEmit(value: T): Boolean
 
@@ -183,6 +204,9 @@ public interface MutableSharedFlow<T> : SharedFlow<T>, FlowCollector<T> {
      * supported, and throws an [UnsupportedOperationException]. To reset a [MutableStateFlow]
      * to an initial value, just update its [value][MutableStateFlow.value].
      *
+     * This method is **thread-safe** and can be safely invoked from concurrent coroutines without
+     * external synchronization.
+     *
      * **Note: This is an experimental api.** This function may be removed or renamed in the future.
      */
     @ExperimentalCoroutinesApi
@@ -202,7 +226,6 @@ public interface MutableSharedFlow<T> : SharedFlow<T>, FlowCollector<T> {
  *   supported only when `replay > 0` or `extraBufferCapacity > 0`).
  */
 @Suppress("FunctionName", "UNCHECKED_CAST")
-@ExperimentalCoroutinesApi
 public fun <T> MutableSharedFlow(
     replay: Int = 0,
     extraBufferCapacity: Int = 0,
@@ -326,7 +349,7 @@ private class SharedFlowImpl<T>(
         var resumes: Array<Continuation<Unit>?> = EMPTY_RESUMES
         val emitted = synchronized(this) {
             if (tryEmitLocked(value)) {
-                resumes = findSlotsToResumeLocked()
+                resumes = findSlotsToResumeLocked(resumes)
                 true
             } else {
                 false
@@ -422,7 +445,7 @@ private class SharedFlowImpl<T>(
             // recheck buffer under lock again (make sure it is really full)
             if (tryEmitLocked(value)) {
                 cont.resume(Unit)
-                resumes = findSlotsToResumeLocked()
+                resumes = findSlotsToResumeLocked(resumes)
                 return@lock null
             }
             // add suspended emitter to the buffer
@@ -430,7 +453,7 @@ private class SharedFlowImpl<T>(
                 enqueueLocked(it)
                 queueSize++ // added to queue of waiting emitters
                 // synchronous shared flow might rendezvous with waiting emitter
-                if (bufferCapacity == 0) resumes = findSlotsToResumeLocked()
+                if (bufferCapacity == 0) resumes = findSlotsToResumeLocked(resumes)
             }
         }
         // outside of the lock: register dispose on cancellation
@@ -501,6 +524,12 @@ private class SharedFlowImpl<T>(
         }
         // Compute new buffer size -> how many values we now actually have after resume
         val newBufferSize1 = (newBufferEndIndex - head).toInt()
+        // Note: When nCollectors == 0 we resume ALL queued emitters and we might have resumed more than bufferCapacity,
+        // and newMinCollectorIndex might pointing the wrong place because of that. The easiest way to fix it is by
+        // forcing newMinCollectorIndex = newBufferEndIndex. We do not needed to update newBufferSize1 (which could be
+        // too big), because the only use of newBufferSize1 in the below code is in the minOf(replay, newBufferSize1)
+        // expression, which coerces values that are too big anyway.
+        if (nCollectors == 0) newMinCollectorIndex = newBufferEndIndex
         // Compute new replay size -> limit to replay the number of items we need, take into account that it can only grow
         var newReplayIndex = maxOf(replayIndex, newBufferEndIndex - minOf(replay, newBufferSize1))
         // adjustment for synchronous case with cancelled emitter (NO_VALUE)
@@ -512,6 +541,8 @@ private class SharedFlowImpl<T>(
         updateBufferLocked(newReplayIndex, newMinCollectorIndex, newBufferEndIndex, newQueueEndIndex)
         // just in case we've moved all buffered emitters and have NO_VALUE's at the tail now
         cleanupTailLocked()
+        // We need to waken up suspended collectors if any emitters were resumed here
+        if (resumes.isNotEmpty()) resumes = findSlotsToResumeLocked(resumes)
         return resumes
     }
 
@@ -598,9 +629,9 @@ private class SharedFlowImpl<T>(
         }
     }
 
-    private fun findSlotsToResumeLocked(): Array<Continuation<Unit>?> {
-        var resumes: Array<Continuation<Unit>?> = EMPTY_RESUMES
-        var resumeCount = 0
+    private fun findSlotsToResumeLocked(resumesIn: Array<Continuation<Unit>?>): Array<Continuation<Unit>?> {
+        var resumes: Array<Continuation<Unit>?> = resumesIn
+        var resumeCount = resumesIn.size
         forEachSlotLocked loop@{ slot ->
             val cont = slot.cont ?: return@loop // only waiting slots
             if (tryPeekLocked(slot) < 0) return@loop // only slots that can peek a value

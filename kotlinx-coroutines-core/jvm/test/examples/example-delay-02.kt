@@ -11,9 +11,20 @@ import kotlinx.coroutines.flow.*
 fun main() = runBlocking {
 
 flow {
-    repeat(10) {
-        emit(it)
-        delay(110)
+    emit(1)
+    delay(90)
+    emit(2)
+    delay(90)
+    emit(3)
+    delay(1010)
+    emit(4)
+    delay(1010)
+    emit(5)
+}.debounce {
+    if (it == 1) {
+        0L
+    } else {
+        1000L
     }
-}.sample(200)
+}
 .toList().joinToString().let { println(it) } }

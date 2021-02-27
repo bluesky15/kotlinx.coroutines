@@ -176,6 +176,73 @@ class SharedFlowScenarioTest : TestBase() {
             collect(b, 15)
         }
 
+    @Test // https://github.com/Kotlin/kotlinx.coroutines/issues/2320
+    fun testResumeFastSubscriberOnResumedEmitter() =
+        testSharedFlow<Int>(MutableSharedFlow(1)) {
+            // create two subscribers and start collecting
+            val s1 = subscribe("s1"); resumeCollecting(s1)
+            val s2 = subscribe("s2"); resumeCollecting(s2)
+            // now emit 0, make sure it is collected
+            emitRightNow(0); expectReplayOf(0)
+            awaitCollected(s1, 0)
+            awaitCollected(s2, 0)
+            // now emit 1, and only first subscriber continues and collects it
+            emitRightNow(1); expectReplayOf(1)
+            collect(s1, 1)
+            // now emit 2, it suspend (s2 is blocking it)
+            val e2 = emitSuspends(2)
+            resumeCollecting(s1) // resume, but does not collect (e2 is still queued)
+            collect(s2, 1) // resume + collect next --> resumes emitter, thus resumes s1
+            awaitCollected(s1, 2) // <-- S1 collects value from the newly resumed emitter here !!!
+            emitResumes(e2); expectReplayOf(2)
+            // now emit 3, it suspends (s2 blocks it)
+            val e3 = emitSuspends(3)
+            collect(s2, 2)
+            emitResumes(e3); expectReplayOf(3)
+        }
+
+    @Test
+    fun testSuspendedConcurrentEmitAndCancelSubscriberReplay1() =
+        testSharedFlow<Int>(MutableSharedFlow(1)) {
+            val a = subscribe("a");
+            emitRightNow(0); expectReplayOf(0)
+            collect(a, 0)
+            emitRightNow(1); expectReplayOf(1)
+            val e2 = emitSuspends(2) // suspends until 1 is collected
+            val e3 = emitSuspends(3) // suspends until 1 is collected, too
+            cancel(a) // must resume emitters 2 & 3
+            emitResumes(e2)
+            emitResumes(e3)
+            expectReplayOf(3) // but replay size is 1 so only 3 should be kept
+            // Note: originally, SharedFlow was in a broken state here with 3 elements in the buffer
+            val b = subscribe("b")
+            collect(b, 3)
+            emitRightNow(4); expectReplayOf(4)
+            collect(b, 4)
+        }
+
+    @Test
+    fun testSuspendedConcurrentEmitAndCancelSubscriberReplay1ExtraBuffer1() =
+        testSharedFlow<Int>(MutableSharedFlow( replay = 1, extraBufferCapacity = 1)) {
+            val a = subscribe("a");
+            emitRightNow(0); expectReplayOf(0)
+            collect(a, 0)
+            emitRightNow(1); expectReplayOf(1)
+            emitRightNow(2); expectReplayOf(2)
+            val e3 = emitSuspends(3) // suspends until 1 is collected
+            val e4 = emitSuspends(4) // suspends until 1 is collected, too
+            val e5 = emitSuspends(5) // suspends until 1 is collected, too
+            cancel(a) // must resume emitters 3, 4, 5
+            emitResumes(e3)
+            emitResumes(e4)
+            emitResumes(e5)
+            expectReplayOf(5)
+            val b = subscribe("b")
+            collect(b, 5)
+            emitRightNow(6); expectReplayOf(6)
+            collect(b, 6)
+        }
+
     private fun <T> testSharedFlow(
         sharedFlow: MutableSharedFlow<T>,
         scenario: suspend ScenarioDsl<T>.() -> Unit
@@ -305,12 +372,21 @@ class SharedFlowScenarioTest : TestBase() {
             return TestJob(job, name)
         }
 
+        // collect ~== resumeCollecting + awaitCollected (for each value)
         suspend fun collect(job: TestJob, vararg a: T) {
             for (value in a) {
                 checkReplay() // should not have changed
-                addAction(ResumeCollecting(job))
-                awaitAction(Collected(job, value))
+                resumeCollecting(job)
+                awaitCollected(job, value)
             }
+        }
+
+        suspend fun resumeCollecting(job: TestJob) {
+            addAction(ResumeCollecting(job))
+        }
+
+        suspend fun awaitCollected(job: TestJob, value: T) {
+            awaitAction(Collected(job, value))
         }
 
         fun stop() {
